@@ -165,47 +165,28 @@ if is_game_over:
     total_guessed = st.session_state.correct_count + st.session_state.wrong_count
     success_percentage = int((st.session_state.correct_count / total_guessed) * 100) if total_guessed > 0 else 0
     
-    # Updated Visual Performance Metrics Dashboard
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Guessed Questions", f"📋 {total_guessed} / {total_photos}")
-    c2.metric("Correct Answers", f"🟢 {st.session_state.correct_count}")
-    c3.metric("Wrong Answers", f"🔴 {st.session_state.wrong_count}")
-    c4.metric("Accuracy Rate (% of Guessed)", f"🎯 {success_percentage}%")
-    
-    st.write("---")
-    
-    # Display Missteps Grouped by Building Name
-    if st.session_state.wrong_answers_ledger:
-        st.subheader("🕵️ Review Your Missed Buildings:")
-        errors_df = pd.DataFrame(st.session_state.wrong_answers_ledger)
-        grouped = errors_df.groupby('building_name')
-        
-        for building, group in grouped:
-            with st.expander(f"🏢 {building} ({len(group)} misidentified photo{'s' if len(group) > 1 else ''})", expanded=True):
-                st.caption(f"**Correct Target Profile:** {group.iloc[0]['correct_profile']}")
-                thumb_cols = st.columns(min(len(group), 4))
-                for idx, (_, row_item) in enumerate(group.iterrows()):
-                    with thumb_cols[idx % 4]:
-                        st.image(row_item['photo_path'], use_container_width=True)
-                        st.error(f"Guessed: {row_item['user_guess'].split(' / ')[0] if '/' in row_item['user_guess'] else row_item['user_guess']}")
-    else:
-        st.success("🏆 Perfect game! You didn't miss a single project.")
-        
+    # ... (Keep your metrics and expander code exactly the same) ...
+
     st.write("### Choose Your Next Round:")
     btn_c1, btn_c2 = st.columns(2)
     
     with btn_c1:
         if st.button("🔄 Play New Full Shuffled Round", type="primary", use_container_width=True):
+            # This completely clears old states and loads a clean deck for the next round
+            st.session_state.last_round_mistake_pool = [] 
             initialize_round(list(range(len(raw_game_pool))))
             
     with btn_c2:
-        # Build alternative mistake replay selection pool dynamically based on recent log saves
-        has_mistakes = len(st.session_state.last_round_mistake_pool) > 0
+        # Dynamically harvest whatever IDs are currently sitting in this session's ledger
+        current_round_mistakes = [int(df[df['unified_option'] == item['correct_profile']].index[0]) 
+                                  for item in st.session_state.wrong_answers_ledger] if st.session_state.wrong_answers_ledger else []
+        
+        has_mistakes = len(current_round_mistakes) > 0
         disable_replay = not has_mistakes
-        button_text = f"🎯 Replay Mistakes Only ({len(st.session_state.last_round_mistake_pool)} photos)" if has_mistakes else "🎯 Replay Mistakes Only (No mistakes last round!)"
+        button_text = f"🎯 Replay Mistakes Only ({len(current_round_mistakes)} photos)" if has_mistakes else "🎯 Replay Mistakes Only (No mistakes!)"
         
         if st.button(button_text, type="secondary", disabled=disable_replay, use_container_width=True):
-            initialize_round(list(st.session_state.last_round_mistake_pool))
+            initialize_round(current_round_mistakes)
     st.stop()
 
 # Regular Game Loop Active View Interface
