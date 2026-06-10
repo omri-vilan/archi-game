@@ -6,7 +6,7 @@ import zipfile
 import re
 import json
 import xml.etree.ElementTree as ET
-import streamlit.components.v1 as components
+from streamlit_javascript import st_javascript
 
 # App Directories Setup
 IMAGE_DIR = "images"
@@ -107,32 +107,9 @@ def load_game_data():
 
 df, raw_game_pool = load_game_data()
 
-# 2. Browser LocalStorage Bridging Component
-def local_storage_sync():
-    """Injects JavaScript to retrieve and sync historical errors seamlessly from the client browser cache"""
-    js_code = """
-    <script>
-    const parentWindow = window.parent;
-    
-    // Listen for data check requests from Streamlit application container
-    window.addEventListener("message", function(event) {
-        if (event.data.type === "REQUEST_MISTAKES") {
-            const savedData = localStorage.getItem("archi_game_mistakes") || "[]";
-            parentWindow.postMessage({type: "MISTAKES_DATA", data: savedData}, "*");
-        }
-        if (event.data.type === "SAVE_MISTAKES") {
-            localStorage.setItem("archi_game_mistakes", event.data.payload);
-        }
-    });
-    
-    // Initial fetch trigger on document rendering mount
-    setTimeout(() => {
-        const initialData = localStorage.getItem("archi_game_mistakes") || "[]";
-        parentWindow.postMessage({type: "MISTAKES_DATA", data: initialData}, "*");
-    }, 300);
-    </script>
-    """
-    components.html(js_code, height=0, width=0)
+# 2. THE BROWSING DISK READ (Fetches your old mistakes instantly on refresh)
+# This executes directly on the browser machine and passes the text back up to Python
+stored_mistakes_raw = st_javascript("localStorage.getItem('archi_game_mistakes')")
 
 # Initialize Session State Structure
 if 'active_pool_indices' not in st.session_state and not raw_game_pool.empty:
@@ -150,14 +127,18 @@ if 'game_forced_stop' not in st.session_state:
     st.session_state.game_forced_stop = False
 if 'wrong_answers_ledger' not in st.session_state:
     st.session_state.wrong_answers_ledger = []  
-if 'persistent_historical_mistakes' not in st.session_state:
-    st.session_state.persistent_historical_mistakes = [] # Loaded persistently from LocalStorage
 if 'answered' not in st.session_state:
     st.session_state.answered = False
 if 'feedback' not in st.session_state:
     st.session_state.feedback = ""
-if 'local_storage_loaded' not in st.session_state:
-    st.session_state.local_storage_loaded = False
+
+# Parse the browser cache data if it successfully returned strings
+persistent_historical_mistakes = []
+if stored_mistakes_raw and stored_mistakes_raw != "null":
+    try:
+        persistent_historical_mistakes = json.loads(stored_mistakes_raw)
+    except Exception:
+        pass
 
 total_photos = len(st.session_state.get('active_pool_indices', []))
 
@@ -176,16 +157,7 @@ def initialize_round(selected_indices):
     reset_question_state()
     st.rerun()
 
-# 3. Handle LocalStorage Event Messaging Passes
-local_storage_sync()
-
-# Listen for incoming HTML window background values passed back up by Javascript macro
-# Streamlit query params workaround or simple state monitoring captures browser event mutations
-if not st.session_state.local_storage_loaded:
-    # A tiny execution check to trigger JavaScript callback tracking values safely
-    st.session_state.local_storage_loaded = True
-
-# 4. UI Configurations Layout
+# 3. UI Configurations Layout
 st.set_page_config(page_title="Architecture Trivia", layout="wide")
 st.title("🏛️ Architecture Guessing Game")
 
@@ -228,16 +200,15 @@ if is_game_over:
                         
         # APPEND NEW MISTAKES TO PERSISTENT STATE ON DEVICE
         for item in st.session_state.wrong_answers_ledger:
-            # Find photo absolute index tracking token
             match_rows = raw_game_pool[raw_game_pool['photo_path'] == item['photo_path']]
             if not match_rows.empty:
                 photo_id = int(match_rows.iloc[0]['index'])
-                if photo_id not in st.session_state.persistent_historical_mistakes:
-                    st.session_state.persistent_historical_mistakes.append(photo_id)
+                if photo_id not in persistent_historical_mistakes:
+                    persistent_historical_mistakes.append(photo_id)
                     
-        # Fire structural payload push down via javascript component to browser disk
-        payload_string = json.dumps(st.session_state.persistent_historical_mistakes)
-        components.html(f"<script>window.parent.postMessage({{type: 'SAVE_MISTAKES', payload: '{payload_string}'}}, '*');</script>", height=0, width=0)
+        # Write back changes directly into browser storage disk using Javascript snippet execution
+        payload_string = json.dumps(persistent_historical_mistakes)
+        st_javascript(f"localStorage.setItem('archi_game_mistakes', '{payload_string}')")
     else:
         st.success("🏆 Perfect game! You didn't miss a single project.")
         
@@ -249,13 +220,12 @@ if is_game_over:
             initialize_round(list(range(len(raw_game_pool))))
             
     with btn_c2:
-        # Check active tracking array lengths
-        has_mistakes = len(st.session_state.persistent_historical_mistakes) > 0
+        has_mistakes = len(persistent_historical_mistakes) > 0
         disable_replay = not has_mistakes
-        button_text = f"🎯 Replay Device Memory Mistakes ({len(st.session_state.persistent_historical_mistakes)} photos)" if has_mistakes else "🎯 Replay Mistakes (No historical mistakes on record!)"
+        button_text = f"🎯 Replay Device Memory Mistakes ({len(persistent_historical_mistakes)} photos)" if has_mistakes else "🎯 Replay Mistakes (No historical mistakes on record!)"
         
         if st.button(button_text, type="secondary", disabled=disable_replay, use_container_width=True):
-            initialize_round(list(st.session_state.persistent_historical_mistakes))
+            initialize_round(list(persistent_historical_mistakes))
     st.stop()
 
 # Regular Game Loop Active View Interface
@@ -265,11 +235,9 @@ st.progress(progress_percentage, text=f"Photo {st.session_state.current_index_pt
 # Sidebar configurations mapping
 st.sidebar.metric("Current Score", f"{st.session_state.correct_count} / {st.session_state.current_index_ptr}")
 
-# Quick clear browser cache link helper inside sidebar frame
 if st.sidebar.button("🗑️ Clear Historical Device Mistakes"):
-    st.session_state.persistent_historical_mistakes = []
-    components.html("<script>window.parent.postMessage({type: 'SAVE_MISTAKES', payload: '[]'}, '*');</script>", height=0, width=0)
-    st.sidebar.success("Device memory wiped clean!")
+    st_javascript("localStorage.setItem('archi_game_mistakes', '[]')")
+    st.sidebar.success("Device memory wiped clean! Refresh to apply changes.")
 
 if st.sidebar.button("Skip to Next Photo"):
     st.session_state.current_index_ptr += 1
@@ -283,7 +251,7 @@ if st.sidebar.button("🛑 Stop Now & See Summary", type="secondary"):
 active_idx = st.session_state.active_pool_indices[st.session_state.current_index_ptr]
 q = raw_game_pool.iloc[active_idx]
 
-# Split Screen Interface Execution Card Frame Layout
+# Split Screen layout allocation frames
 view_left, view_right = st.columns([3, 2], gap="large")
 
 with view_left:
@@ -318,13 +286,12 @@ with view_right:
                 st.session_state.correct_count += 1
                 st.session_state.feedback = "🎉 **Correct!** Excellent job."
                 
-                # If they guess it correctly now, remove it permanently from their persistent device mistake queue array
+                # If they guess it correctly, remove it from the historical mistakes array permanently
                 photo_absolute_id = int(q['index'])
-                if photo_absolute_id in st.session_state.persistent_historical_mistakes:
-                    st.session_state.persistent_historical_mistakes.remove(photo_absolute_id)
-                    # Push updated state to browser disk cache automatically
-                    payload_string = json.dumps(st.session_state.persistent_historical_mistakes)
-                    components.html(f"<script>window.parent.postMessage({{type: 'SAVE_MISTAKES', payload: '{payload_string}'}}, '*');</script>", height=0, width=0)
+                if photo_absolute_id in persistent_historical_mistakes:
+                    persistent_historical_mistakes.remove(photo_absolute_id)
+                    payload_string = json.dumps(persistent_historical_mistakes)
+                    st_javascript(f"localStorage.setItem('archi_game_mistakes', '{payload_string}')")
             else:
                 st.session_state.wrong_count += 1
                 st.session_state.feedback = f"❌ **Not quite!**\n\nThe correct answer is:\n\n`{q['unified_option']}`"
