@@ -4,7 +4,9 @@ import random
 import os
 import zipfile
 import re
+import json
 import xml.etree.ElementTree as ET
+import streamlit.components.v1 as components
 
 # App Directories Setup
 IMAGE_DIR = "images"
@@ -95,7 +97,7 @@ def load_game_data():
             if col_letter in col_to_name and 0 <= df_row_idx < len(df):
                 row_data = df.iloc[df_row_idx]
                 pool_records.append({
-                    'index': len(pool_records), # Keep absolute track of each unique photo record
+                    'index': len(pool_records), 
                     'building_name_clean': row_data['building name'],
                     'unified_option': row_data['unified_option'],
                     'photo_path': local_img_path
@@ -105,9 +107,35 @@ def load_game_data():
 
 df, raw_game_pool = load_game_data()
 
-# 2. Advanced Session State Control
+# 2. Browser LocalStorage Bridging Component
+def local_storage_sync():
+    """Injects JavaScript to retrieve and sync historical errors seamlessly from the client browser cache"""
+    js_code = """
+    <script>
+    const parentWindow = window.parent;
+    
+    // Listen for data check requests from Streamlit application container
+    window.addEventListener("message", function(event) {
+        if (event.data.type === "REQUEST_MISTAKES") {
+            const savedData = localStorage.getItem("archi_game_mistakes") || "[]";
+            parentWindow.postMessage({type: "MISTAKES_DATA", data: savedData}, "*");
+        }
+        if (event.data.type === "SAVE_MISTAKES") {
+            localStorage.setItem("archi_game_mistakes", event.data.payload);
+        }
+    });
+    
+    // Initial fetch trigger on document rendering mount
+    setTimeout(() => {
+        const initialData = localStorage.getItem("archi_game_mistakes") || "[]";
+        parentWindow.postMessage({type: "MISTAKES_DATA", data: initialData}, "*");
+    }, 300);
+    </script>
+    """
+    components.html(js_code, height=0, width=0)
+
+# Initialize Session State Structure
 if 'active_pool_indices' not in st.session_state and not raw_game_pool.empty:
-    # Full deck mode on initial startup
     full_indices = list(range(len(raw_game_pool)))
     random.shuffle(full_indices)
     st.session_state.active_pool_indices = full_indices
@@ -121,13 +149,15 @@ if 'wrong_count' not in st.session_state:
 if 'game_forced_stop' not in st.session_state:
     st.session_state.game_forced_stop = False
 if 'wrong_answers_ledger' not in st.session_state:
-    st.session_state.wrong_answers_ledger = []  # Running log of mistake objects
-if 'last_round_mistake_pool' not in st.session_state:
-    st.session_state.last_round_mistake_pool = [] # Retains photo IDs missed for re-testing
+    st.session_state.wrong_answers_ledger = []  
+if 'persistent_historical_mistakes' not in st.session_state:
+    st.session_state.persistent_historical_mistakes = [] # Loaded persistently from LocalStorage
 if 'answered' not in st.session_state:
     st.session_state.answered = False
 if 'feedback' not in st.session_state:
     st.session_state.feedback = ""
+if 'local_storage_loaded' not in st.session_state:
+    st.session_state.local_storage_loaded = False
 
 total_photos = len(st.session_state.get('active_pool_indices', []))
 
@@ -135,7 +165,6 @@ def reset_question_state():
     st.session_state.answered = False
     st.session_state.feedback = ""
 
-# Helper to prepare subsequent sessions
 def initialize_round(selected_indices):
     random.shuffle(selected_indices)
     st.session_state.active_pool_indices = selected_indices
@@ -147,8 +176,17 @@ def initialize_round(selected_indices):
     reset_question_state()
     st.rerun()
 
-# 3. UI Configurations Layout
-st.set_page_config(page_title="Architecture Trivia", layout="wide") # Shifted to wide format to maximize separation
+# 3. Handle LocalStorage Event Messaging Passes
+local_storage_sync()
+
+# Listen for incoming HTML window background values passed back up by Javascript macro
+# Streamlit query params workaround or simple state monitoring captures browser event mutations
+if not st.session_state.local_storage_loaded:
+    # A tiny execution check to trigger JavaScript callback tracking values safely
+    st.session_state.local_storage_loaded = True
+
+# 4. UI Configurations Layout
+st.set_page_config(page_title="Architecture Trivia", layout="wide")
 st.title("🏛️ Architecture Guessing Game")
 
 if raw_game_pool.empty:
@@ -165,36 +203,73 @@ if is_game_over:
     total_guessed = st.session_state.correct_count + st.session_state.wrong_count
     success_percentage = int((st.session_state.correct_count / total_guessed) * 100) if total_guessed > 0 else 0
     
-    # ... (Keep your metrics and expander code exactly the same) ...
-
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Guessed Questions", f"📋 {total_guessed} / {total_photos}")
+    c2.metric("Correct Answers", f"🟢 {st.session_state.correct_count}")
+    c3.metric("Wrong Answers", f"🔴 {st.session_state.wrong_count}")
+    c4.metric("Accuracy Rate", f"🎯 {success_percentage}%")
+    
+    st.write("---")
+    
+    # Process Current and Historical Mistakes Ledger
+    if st.session_state.wrong_answers_ledger:
+        st.subheader("🕵️ Review Your Missed Buildings:")
+        errors_df = pd.DataFrame(st.session_state.wrong_answers_ledger)
+        grouped = errors_df.groupby('building_name')
+        
+        for building, group in grouped:
+            with st.expander(f"🏢 {building} ({len(group)} misidentified photo{'s' if len(group) > 1 else ''})", expanded=True):
+                st.caption(f"**Correct Target Profile:** {group.iloc[0]['correct_profile']}")
+                thumb_cols = st.columns(min(len(group), 4))
+                for idx, (_, row_item) in enumerate(group.iterrows()):
+                    with thumb_cols[idx % 4]:
+                        st.image(row_item['photo_path'], use_container_width=True)
+                        st.error(f"Guessed: {row_item['user_guess'].split(' / ')[0] if '/' in row_item['user_guess'] else row_item['user_guess']}")
+                        
+        # APPEND NEW MISTAKES TO PERSISTENT STATE ON DEVICE
+        for item in st.session_state.wrong_answers_ledger:
+            # Find photo absolute index tracking token
+            match_rows = raw_game_pool[raw_game_pool['photo_path'] == item['photo_path']]
+            if not match_rows.empty:
+                photo_id = int(match_rows.iloc[0]['index'])
+                if photo_id not in st.session_state.persistent_historical_mistakes:
+                    st.session_state.persistent_historical_mistakes.append(photo_id)
+                    
+        # Fire structural payload push down via javascript component to browser disk
+        payload_string = json.dumps(st.session_state.persistent_historical_mistakes)
+        components.html(f"<script>window.parent.postMessage({{type: 'SAVE_MISTAKES', payload: '{payload_string}'}}, '*');</script>", height=0, width=0)
+    else:
+        st.success("🏆 Perfect game! You didn't miss a single project.")
+        
     st.write("### Choose Your Next Round:")
     btn_c1, btn_c2 = st.columns(2)
     
     with btn_c1:
         if st.button("🔄 Play New Full Shuffled Round", type="primary", use_container_width=True):
-            # This completely clears old states and loads a clean deck for the next round
-            st.session_state.last_round_mistake_pool = [] 
             initialize_round(list(range(len(raw_game_pool))))
             
     with btn_c2:
-        # Dynamically harvest whatever IDs are currently sitting in this session's ledger
-        current_round_mistakes = [int(df[df['unified_option'] == item['correct_profile']].index[0]) 
-                                  for item in st.session_state.wrong_answers_ledger] if st.session_state.wrong_answers_ledger else []
-        
-        has_mistakes = len(current_round_mistakes) > 0
+        # Check active tracking array lengths
+        has_mistakes = len(st.session_state.persistent_historical_mistakes) > 0
         disable_replay = not has_mistakes
-        button_text = f"🎯 Replay Mistakes Only ({len(current_round_mistakes)} photos)" if has_mistakes else "🎯 Replay Mistakes Only (No mistakes!)"
+        button_text = f"🎯 Replay Device Memory Mistakes ({len(st.session_state.persistent_historical_mistakes)} photos)" if has_mistakes else "🎯 Replay Mistakes (No historical mistakes on record!)"
         
         if st.button(button_text, type="secondary", disabled=disable_replay, use_container_width=True):
-            initialize_round(current_round_mistakes)
+            initialize_round(list(st.session_state.persistent_historical_mistakes))
     st.stop()
 
 # Regular Game Loop Active View Interface
 progress_percentage = st.session_state.current_index_ptr / total_photos if total_photos > 0 else 0
 st.progress(progress_percentage, text=f"Photo {st.session_state.current_index_ptr + 1} of {total_photos}")
 
-# Sidebar controls column mapping
+# Sidebar configurations mapping
 st.sidebar.metric("Current Score", f"{st.session_state.correct_count} / {st.session_state.current_index_ptr}")
+
+# Quick clear browser cache link helper inside sidebar frame
+if st.sidebar.button("🗑️ Clear Historical Device Mistakes"):
+    st.session_state.persistent_historical_mistakes = []
+    components.html("<script>window.parent.postMessage({type: 'SAVE_MISTAKES', payload: '[]'}, '*');</script>", height=0, width=0)
+    st.sidebar.success("Device memory wiped clean!")
 
 if st.sidebar.button("Skip to Next Photo"):
     st.session_state.current_index_ptr += 1
@@ -205,11 +280,10 @@ if st.sidebar.button("🛑 Stop Now & See Summary", type="secondary"):
     st.session_state.game_forced_stop = True
     st.rerun()
 
-# Extract active photo row
 active_idx = st.session_state.active_pool_indices[st.session_state.current_index_ptr]
 q = raw_game_pool.iloc[active_idx]
 
-# FIXED INTERFACE: Side-by-side split screen layout column allocations
+# Split Screen Interface Execution Card Frame Layout
 view_left, view_right = st.columns([3, 2], gap="large")
 
 with view_left:
@@ -221,7 +295,6 @@ with view_left:
 
 with view_right:
     st.subheader("Quiz Control Panel")
-    st.write("Analyze the image on the left and select its matching architectural specifications profile below.")
     st.write("---")
     
     full_options_pool = sorted(df['unified_option'].dropna().unique().tolist())
@@ -244,32 +317,28 @@ with view_right:
             if is_correct:
                 st.session_state.correct_count += 1
                 st.session_state.feedback = "🎉 **Correct!** Excellent job."
+                
+                # If they guess it correctly now, remove it permanently from their persistent device mistake queue array
+                photo_absolute_id = int(q['index'])
+                if photo_absolute_id in st.session_state.persistent_historical_mistakes:
+                    st.session_state.persistent_historical_mistakes.remove(photo_absolute_id)
+                    # Push updated state to browser disk cache automatically
+                    payload_string = json.dumps(st.session_state.persistent_historical_mistakes)
+                    components.html(f"<script>window.parent.postMessage({{type: 'SAVE_MISTAKES', payload: '{payload_string}'}}, '*');</script>", height=0, width=0)
             else:
                 st.session_state.wrong_count += 1
                 st.session_state.feedback = f"❌ **Not quite!**\n\nThe correct answer is:\n\n`{q['unified_option']}`"
                 
-                # Log mistake metadata down to display on the grouped final card layout
                 st.session_state.wrong_answers_ledger.append({
                     'building_name': q['building_name_clean'],
                     'correct_profile': q['unified_option'],
                     'user_guess': guess,
                     'photo_path': q['photo_path']
                 })
-                
-                # Append this unique photo's core index key to the mistake replay pool array
-                photo_absolute_id = int(q['index'])
-                if photo_absolute_id not in st.session_state.last_round_mistake_pool:
-                    st.session_state.last_round_mistake_pool.append(photo_absolute_id)
             st.rerun()
 
     if st.session_state.answered:
         st.info(st.session_state.feedback)
-        
-        # If they guessed correctly, remove that photo from the mistake replay tracking pool
-        is_correct = str(guess).strip() == str(q['unified_option']).strip()
-        if is_correct and int(q['index']) in st.session_state.last_round_mistake_pool:
-            st.session_state.last_round_mistake_pool.remove(int(q['index']))
-            
         if st.button("Advance to Next Photo ➡️", use_container_width=True):
             st.session_state.current_index_ptr += 1
             reset_question_state()
